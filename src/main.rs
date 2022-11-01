@@ -3,37 +3,12 @@
 #![feature(inline_const_pat)]
 #![allow(incomplete_features)]
 
-use core::arch::asm;
-
 /// This is how many columns the hex editor has. Align stuff to this
 const ALIGN: usize = 32;
 
 #[panic_handler]
 fn ph(_info: &core::panic::PanicInfo) -> ! {
     loop {}
-}
-
-/// A region with a start subtracted from the stack pointer
-struct NegOffsetedRegion {
-    off: usize,
-    len: usize,
-}
-
-// Put buffers high up the stack where they don't interfere with anything else
-const PLAYFIELD_REGION: NegOffsetedRegion = NegOffsetedRegion {
-    off: 100_000,
-    len: ALIGN * ALIGN,
-};
-
-impl NegOffsetedRegion {
-    unsafe fn make_slice_from_sp(&self, stack_ptr: *mut u8) -> &'static mut [u8] {
-        let mut ptr = stack_ptr.sub(self.off);
-        // Align to hex editor width
-        while (ptr as usize) % ALIGN != 0 {
-            ptr = ptr.sub(1);
-        }
-        core::slice::from_raw_parts_mut(ptr, self.len)
-    }
 }
 
 type Level<'a> = &'a [u8];
@@ -65,19 +40,21 @@ const LEVEL_2: Level = b"\
 #######
 ";
 
-const LEVELS: [Level; 3] = [LEVEL_0, LEVEL_1, LEVEL_2];
-
-#[derive(Default)]
-struct Game {
-    level_idx: usize,
-}
-
-fn load_level(lvl: &[u8], playfield: &mut [u8]) {
-    let ptr = playfield.as_mut_ptr();
+#[inline(always)]
+unsafe fn load_level() {
+    let lvl_idx = mem_read(LEVEL_OFFS) as usize;
+    let lvl = match lvl_idx {
+        0 => LEVEL_0,
+        1 => LEVEL_1,
+        2 => LEVEL_2,
+        _ => loop {},
+    };
+    mem_playfield_clear();
     let mut x = 0;
     let mut y = 0;
 
-    for &byte in lvl {
+    for i in 0..lvl.len() {
+        let byte = lvl.as_ptr().add(i).read_volatile();
         let ch = match byte {
             b'\n' => {
                 x = 0;
@@ -92,10 +69,7 @@ fn load_level(lvl: &[u8], playfield: &mut [u8]) {
             b' ' | b'-' | b'_' => TILES.floor,
             c => c,
         };
-        unsafe {
-            ptr.add(y * ALIGN + x).write_volatile(ch);
-        }
-        //playfield[y * ALIGN + x] = ch;
+        mem_write(y * ALIGN + x, ch);
         x += 1;
     }
 }
@@ -120,83 +94,115 @@ const TILES: Chars = Chars {
     floor: 0,
 };
 
-impl Game {
-    fn level_start(&mut self, playfield: &mut [u8]) {
-        load_level(LEVELS[self.level_idx], playfield);
-    }
-    fn update(&mut self, playfield: &mut [u8], input: u8) {
-        let player_idx = playfield
-            .iter()
-            .position(|&b| b == TILES.pusher)
-            .unwrap_or(0);
-        enum Dir {
-            Up,
-            Down,
-            Left,
-            Right,
-        }
-        let (dir, new_idx) = match input {
-            b'w' => (Dir::Up, player_idx - ALIGN),
-            b'd' => (Dir::Right, player_idx + 1),
-            b's' => (Dir::Down, player_idx + ALIGN),
-            b'a' => (Dir::Left, player_idx - 1),
-            b'r' => {
-                self.level_start(playfield);
-                return;
-            }
-            _ => return,
-        };
-        let obj = playfield[new_idx];
-        match obj {
-            const { TILES.floor } => playfield.swap(player_idx, new_idx),
-            const { TILES.box_ } => {
-                let box_idx = new_idx;
-                let box_new_idx = match dir {
-                    Dir::Up => box_idx - ALIGN,
-                    Dir::Down => box_idx + ALIGN,
-                    Dir::Left => box_idx - 1,
-                    Dir::Right => box_idx + 1,
-                };
-                match playfield[box_new_idx] {
-                    const {TILES.floor} => playfield.swap(box_idx, box_new_idx),
-                    const {TILES.goal} => {
-                        playfield[box_idx] = TILES.floor;
-                        playfield[box_new_idx] = TILES.box_on_goal;
-                    }
-                    _ => {}
-                }
-            }
-            _ => {}
-        }
-        // Win condition: No empty goals
-        if !playfield.into_iter().any(|b| *b == TILES.goal) {
-            self.level_idx += 1;
-            load_level(LEVELS[self.level_idx], playfield);
-        }
+#[inline(always)]
+unsafe fn mem_swap(idx1: usize, idx2: usize) {
+    let tmp = MEM.as_ptr().add(idx1).read_volatile();
+    MEM.as_mut_ptr()
+        .add(idx1)
+        .write_volatile(MEM.as_ptr().add(idx2).read_volatile());
+    MEM.as_mut_ptr().add(idx2).write_volatile(tmp);
+}
+
+#[inline(always)]
+unsafe fn mem_read(idx: usize) -> u8 {
+    MEM.as_ptr().add(idx).read_volatile()
+}
+
+#[inline(always)]
+unsafe fn mem_write(idx: usize, val: u8) {
+    MEM.as_mut_ptr().add(idx).write_volatile(val)
+}
+
+/// Clear with a nice recognizable byte
+#[inline(always)]
+unsafe fn mem_playfield_clear() {
+    for i in 0..PLAYFIELD_END {
+        MEM.as_mut_ptr().add(i).write_volatile(0xCC);
     }
 }
 
-unsafe fn ui_ptr(stack_ptr: *mut u8) -> *mut u8 {
-    stack_ptr
-        .sub(PLAYFIELD_REGION.off)
-        .add(PLAYFIELD_REGION.len)
+#[inline(always)]
+unsafe fn update() {
+    let input: u8 = mem_read(INPUT_OFFS);
+    let mut player_idx = 0;
+    for i in 0..PLAYFIELD_END {
+        if mem_read(i) == TILES.pusher {
+            player_idx = i;
+        }
+    }
+    enum Dir {
+        Up,
+        Down,
+        Left,
+        Right,
+    }
+    let (dir, new_idx) = match input {
+        b'w' => (Dir::Up, player_idx - ALIGN),
+        b'd' => (Dir::Right, player_idx + 1),
+        b's' => (Dir::Down, player_idx + ALIGN),
+        b'a' => (Dir::Left, player_idx - 1),
+        b'r' => {
+            load_level();
+            return;
+        }
+        _ => return,
+    };
+    let obj = mem_read(new_idx);
+    match obj {
+        const { TILES.floor } => mem_swap(player_idx, new_idx),
+        const { TILES.box_ } => {
+            let box_idx = new_idx;
+            let box_new_idx = match dir {
+                Dir::Up => box_idx - ALIGN,
+                Dir::Down => box_idx + ALIGN,
+                Dir::Left => box_idx - 1,
+                Dir::Right => box_idx + 1,
+            };
+            match mem_read(box_new_idx) {
+                const { TILES.floor } => mem_swap(box_idx, box_new_idx),
+                const { TILES.goal } => {
+                    mem_write(box_idx, TILES.floor);
+                    mem_write(box_new_idx, TILES.box_on_goal);
+                }
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+    // Win condition: No empty goals
+    let mut win = true;
+    for i in 0..PLAYFIELD_END {
+        let tile = mem_read(i);
+        if tile == TILES.goal {
+            win = false;
+        }
+    }
+    if win {
+        mem_write(LEVEL_OFFS, mem_read(LEVEL_OFFS) + 1);
+        load_level();
+    }
 }
 
 #[no_mangle]
 unsafe extern "C" fn _start() {
-    let mut stack_ptr: *mut u8;
-    asm! {"mov {}, rsp", out(reg) stack_ptr };
-    let playfield = PLAYFIELD_REGION.make_slice_from_sp(stack_ptr);
-    let mut game = Game::default();
-    game.level_start(playfield);
-    ui_ptr(stack_ptr).write_volatile(0xff);
+    mem_write(INPUT_OFFS, INPUT_NONE);
+    mem_write(LEVEL_OFFS, 0);
+    load_level();
     loop {
         // Wait for input
-        while ui_ptr(stack_ptr).read_volatile() == 0xff {}
+        while mem_read(INPUT_OFFS) == INPUT_NONE {}
         // Update
-        let input = ui_ptr(stack_ptr).read_volatile();
-        game.update(playfield, input);
+        update();
         // Reset input to waiting state
-        ui_ptr(stack_ptr).write_volatile(0xff);
+        mem_write(INPUT_OFFS, INPUT_NONE);
     }
 }
+
+const INPUT_NONE: u8 = b' ';
+
+const MEM_SIZE: usize = ALIGN * 24;
+const INPUT_OFFS: usize = MEM_SIZE - 1;
+const LEVEL_OFFS: usize = MEM_SIZE - 2;
+const PLAYFIELD_END: usize = MEM_SIZE - 3;
+
+static mut MEM: [u8; MEM_SIZE] = [0; MEM_SIZE];
